@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.net.Uri
 import android.os.Build
@@ -17,6 +18,7 @@ data class CompressResult(
     val newUri: Uri?,
     val newSizeBytes: Long,
     val skipped: Boolean,
+    val reason: String = "",
 )
 
 object ImageCompressor {
@@ -33,22 +35,32 @@ object ImageCompressor {
         maxDimension: Int,
     ): CompressResult = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
+        val originalSize = item.sizeBytes.takeIf { it > 0L }
+            ?: readUriSizeBytes(resolver, item.uri)
 
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         resolver.openInputStream(item.uri)?.use {
             BitmapFactory.decodeStream(it, null, bounds)
-        } ?: return@withContext CompressResult(item, null, 0, skipped = true)
+        }
 
         var sample = 1
-        while (
-            bounds.outWidth / (sample * 2) >= maxDimension ||
-            bounds.outHeight / (sample * 2) >= maxDimension
-        ) sample *= 2
+        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+            while (
+                bounds.outWidth / (sample * 2) >= maxDimension ||
+                bounds.outHeight / (sample * 2) >= maxDimension
+            ) sample *= 2
+        }
 
         val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
         var bitmap = resolver.openInputStream(item.uri)?.use {
             BitmapFactory.decodeStream(it, null, decodeOpts)
-        } ?: return@withContext CompressResult(item, null, 0, skipped = true)
+        }
+        if (bitmap == null && Build.VERSION.SDK_INT >= 28) {
+            bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(resolver, item.uri))
+        }
+        if (bitmap == null) {
+            return@withContext CompressResult(item, null, 0, skipped = true, reason = "không đọc được ảnh")
+        }
 
         // Scale chính xác về maxDimension nếu vẫn lớn hơn
         val longSide = maxOf(bitmap.width, bitmap.height)
@@ -67,10 +79,10 @@ object ImageCompressor {
         // Giữ đúng chiều xoay từ EXIF
         bitmap = applyExifRotation(resolver.openInputStream(item.uri), bitmap)
 
-        val format = if (Build.VERSION.SDK_INT >= 30)
-            Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.JPEG
-        val ext = if (Build.VERSION.SDK_INT >= 30) "webp" else "jpg"
-        val mime = if (Build.VERSION.SDK_INT >= 30) "image/webp" else "image/jpeg"
+        // JPEG tương thích rộng hơn WebP trên một số máy
+        val format = Bitmap.CompressFormat.JPEG
+        val ext = "jpg"
+        val mime = "image/jpeg"
 
         val baseName = item.name.substringBeforeLast('.')
         val values = ContentValues().apply {
@@ -83,7 +95,7 @@ object ImageCompressor {
         val newUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             ?: run {
                 bitmap.recycle()
-                return@withContext CompressResult(item, null, 0, skipped = true)
+                return@withContext CompressResult(item, null, 0, skipped = true, reason = "không lưu được file")
             }
 
         resolver.openOutputStream(newUri)?.use { out ->
@@ -95,17 +107,31 @@ object ImageCompressor {
         values.put(MediaStore.Images.Media.IS_PENDING, 0)
         resolver.update(newUri, values, null, null)
 
-        val newSize = resolver.query(
+        var newSize = resolver.query(
             newUri, arrayOf(MediaStore.Images.Media.SIZE), null, null, null
         )?.use { c -> if (c.moveToFirst()) c.getLong(0) else 0L } ?: 0L
+        if (newSize <= 0L) newSize = readUriSizeBytes(resolver, newUri)
 
-        // Không tiết kiệm được thì xoá bản nén, giữ ảnh gốc
-        if (newSize == 0L || newSize >= item.sizeBytes) {
+        if (newSize <= 0L) {
             resolver.delete(newUri, null, null)
-            return@withContext CompressResult(item, null, item.sizeBytes, skipped = true)
+            return@withContext CompressResult(item, null, 0, skipped = true, reason = "file nén rỗng")
+        }
+
+        // Chỉ bỏ qua khi biết chắc dung lượng gốc và bản nén không nhẹ hơn
+        if (originalSize > 0L && newSize >= originalSize) {
+            resolver.delete(newUri, null, null)
+            return@withContext CompressResult(
+                item, null, originalSize, skipped = true, reason = "đã tối ưu sẵn"
+            )
         }
 
         CompressResult(item, newUri, newSize, skipped = false)
+    }
+
+    private fun readUriSizeBytes(resolver: android.content.ContentResolver, uri: Uri): Long {
+        return resolver.openFileDescriptor(uri, "r")?.use {
+            it.statSize.coerceAtLeast(0L)
+        } ?: 0L
     }
 
     private fun applyExifRotation(

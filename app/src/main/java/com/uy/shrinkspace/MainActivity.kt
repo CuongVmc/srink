@@ -44,6 +44,8 @@ class ShrinkViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var compressedCount by mutableStateOf(0)
         private set
+    var skippedCount by mutableStateOf(0)
+        private set
     var originalsToDelete by mutableStateOf<List<Uri>>(emptyList())
         private set
 
@@ -62,6 +64,7 @@ class ShrinkViewModel(app: Application) : AndroidViewModel(app) {
         progress = 0
         savedBytes = 0
         compressedCount = 0
+        skippedCount = 0
         val deletable = mutableListOf<Uri>()
         viewModelScope.launch {
             for ((index, item) in images.withIndex()) {
@@ -69,9 +72,12 @@ class ShrinkViewModel(app: Application) : AndroidViewModel(app) {
                     getApplication(), item, quality.toInt(), maxDimension
                 )
                 if (!result.skipped) {
-                    savedBytes += item.sizeBytes - result.newSizeBytes
+                    val original = item.sizeBytes.takeIf { it > 0 } ?: result.newSizeBytes
+                    savedBytes += (original - result.newSizeBytes).coerceAtLeast(0)
                     compressedCount++
                     deletable.add(item.uri)
+                } else {
+                    skippedCount++
                 }
                 progress = index + 1
             }
@@ -199,9 +205,14 @@ fun ShrinkScreen(vm: ShrinkViewModel = viewModel()) {
 
             Phase.Done -> {
                 StatCard(
-                    "Xong! Nén được ${vm.compressedCount} ảnh",
-                    "Tiết kiệm: ${MediaScanner.formatBytes(vm.savedBytes)}\n" +
-                        "Ảnh nén lưu ở album Pictures/ShrinkSpace",
+                    "Xong! Nén được ${vm.compressedCount}/${vm.images.size} ảnh",
+                    buildString {
+                        append("Tiết kiệm: ${MediaScanner.formatBytes(vm.savedBytes)}\n")
+                        append("Ảnh nén lưu ở album Pictures/ShrinkSpace")
+                        if (vm.skippedCount > 0) {
+                            append("\nBỏ qua ${vm.skippedCount} ảnh (đã tối ưu sẵn hoặc không đọc được)")
+                        }
+                    },
                 )
 
                 if (vm.originalsToDelete.isNotEmpty() && Build.VERSION.SDK_INT >= 30) {
